@@ -1,0 +1,9 @@
+Asset: JCY2001D final-logo ocean wave
+Selected candidate: 3 (wave_03_cc0-11505__transitking__wavesound.flac)
+Source page: https://opengameart.org/content/beach-ocean-waves
+License: CC0
+Downloaded: 2026-08-03
+Processing: trim 0.15-1.35 s, mono 22050 Hz, high-pass 70 Hz,
+low-pass 9000 Hz, 40 ms fade-in, 180 ms fade-out, loudness normalize,
+then -6 dB device-volume trim. Playback duplicates each source sample to
+44100 Hz stereo for the JC8048W550 NS4168 I2S output.

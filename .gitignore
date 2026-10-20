@@ -1,0 +1,31 @@
+
+# Credentials and local configuration
+# Local large vendor-library link. See docs/BUILD.md.
+# PlatformIO build/cache artifacts
+# Runtime diagnostics and transient captures
+*.key
+*.log
+*.pem
+.DS_Store
+.env
+.env.*
+.pio-*/
+.pio/
+.dummy/
+managed_components/
+sdkconfig.defaults
+sdkconfig.*
+/lib-idf55
+build/
+captures/
+lib-idf55/
+logs/
+screenshots/
+tmp/
+tools/*.bak
+tools/__pycache__/
+.jcy-agent-lock/
+
+# Protected local history and raw diagnostics are backed up separately.
+/backups/
+/diagnostics/

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Keep the on-screen firmware version and build tag internally consistent.
+set -euo pipefail
+
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qx 'src/main.cpp'; then
+    exit 0
+fi
+
+staged_source="$(git show :src/main.cpp)"
+version="$(sed -n \
+    's/^#define JCY1000_FIRMWARE_VERSION "\([^"]*\)"/\1/p' \
+    <<< "$staged_source")"
+build_tag="$(awk \
+    '/^#define JCY1000_BUILD_TAG/{getline; gsub(/^[[:space:]]*"|"[[:space:]]*$/, ""); print; exit}' \
+    <<< "$staged_source")"
+
+if [[ -z "$version" || -z "$build_tag" ]]; then
+    echo "ERROR: JCY1000 firmware version or build tag is missing." >&2
+    exit 1
+fi
+if [[ "$build_tag" != *"$version"* ]]; then
+    echo "ERROR: JCY1000_BUILD_TAG must include $version." >&2
+    echo "Use scripts/jcy_release_version.py bump from the locked canonical tree." >&2
+    exit 1
+fi

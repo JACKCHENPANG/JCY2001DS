@@ -1,0 +1,178 @@
+#include <Arduino.h>
+#include <esp32_smartdisplay.h>
+#include <lvgl.h>
+#include <math.h>
+
+namespace {
+lv_obj_t *chart;
+lv_obj_t *run_button;
+lv_obj_t *run_label;
+lv_obj_t *voltage_label;
+lv_chart_series_t *wave_series;
+bool running = true;
+uint32_t sample_index = 0;
+uint32_t last_sample_ms = 0;
+
+lv_color_t color(uint32_t rgb) { return lv_color_hex(rgb); }
+
+lv_obj_t *make_panel(lv_obj_t *parent, int x, int y, int w, int h) {
+    lv_obj_t *panel = lv_obj_create(parent);
+    lv_obj_set_pos(panel, x, y);
+    lv_obj_set_size(panel, w, h);
+    lv_obj_set_style_radius(panel, 10, 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_border_color(panel, color(0x27374A), 0);
+    lv_obj_set_style_bg_color(panel, color(0x111A26), 0);
+    lv_obj_set_style_pad_all(panel, 12, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    return panel;
+}
+
+void add_title(lv_obj_t *parent, const char *text) {
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_color(label, color(0x8FA3B8), 0);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, 0);
+}
+
+void run_event(lv_event_t *event) {
+    (void)event;
+    running = !running;
+    lv_label_set_text(run_label, running ? "PAUSE" : "RUN");
+    lv_obj_set_style_bg_color(run_button, running ? color(0xE5A72C) : color(0x1CC8A0), 0);
+}
+
+void create_ui() {
+    lv_obj_t *screen = lv_obj_create(nullptr);
+    lv_obj_set_style_bg_color(screen, color(0x08111C), 0);
+    lv_obj_set_style_bg_grad_color(screen, color(0x101D2B), 0);
+    lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_pad_all(screen, 0, 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_screen_load(screen);
+
+    lv_obj_t *header = lv_obj_create(screen);
+    lv_obj_set_pos(header, 0, 0);
+    lv_obj_set_size(header, 800, 58);
+    lv_obj_set_style_radius(header, 0, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_bg_color(header, color(0x0D1723), 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *brand = lv_label_create(header);
+    lv_label_set_text(brand, "JCY1000-5");
+    lv_obj_set_style_text_color(brand, color(0xF4F7FA), 0);
+    lv_obj_set_style_text_font(brand, &lv_font_montserrat_24, 0);
+    lv_obj_align(brand, LV_ALIGN_LEFT_MID, 14, 0);
+
+    lv_obj_t *subtitle = lv_label_create(header);
+    lv_label_set_text(subtitle, "INSTRUMENT DISPLAY  |  CH1");
+    lv_obj_set_style_text_color(subtitle, color(0x6D839A), 0);
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
+    lv_obj_align(subtitle, LV_ALIGN_LEFT_MID, 184, 1);
+
+    lv_obj_t *status = lv_label_create(header);
+    lv_label_set_text(status, "●  READY");
+    lv_obj_set_style_text_color(status, color(0x1CC8A0), 0);
+    lv_obj_set_style_text_font(status, &lv_font_montserrat_16, 0);
+    lv_obj_align(status, LV_ALIGN_RIGHT_MID, -14, 0);
+
+    lv_obj_t *wave_panel = make_panel(screen, 14, 70, 570, 328);
+    add_title(wave_panel, "LIVE WAVEFORM");
+
+    chart = lv_chart_create(wave_panel);
+    lv_obj_set_pos(chart, 0, 34);
+    lv_obj_set_size(chart, 544, 263);
+    lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(chart, 160);
+    lv_chart_set_range(chart, LV_CHART_AXIS_PRIMARY_Y, -100, 100);
+    lv_chart_set_div_line_count(chart, 7, 11);
+    lv_obj_set_style_bg_color(chart, color(0x09121D), 0);
+    lv_obj_set_style_border_width(chart, 1, 0);
+    lv_obj_set_style_border_color(chart, color(0x25374A), 0);
+    lv_obj_set_style_line_color(chart, color(0x1D2A39), LV_PART_MAIN);
+    lv_obj_set_style_line_width(chart, 1, LV_PART_MAIN);
+    lv_obj_set_style_size(chart, 0, 0, LV_PART_INDICATOR);
+    wave_series = lv_chart_add_series(chart, color(0x20D6B0), LV_CHART_AXIS_PRIMARY_Y);
+
+    for (int i = 0; i < 160; ++i) {
+        const int value = static_cast<int>(55.0f * sinf(i * 0.14f) + 12.0f * sinf(i * 0.51f));
+        lv_chart_set_next_value(chart, wave_series, value);
+    }
+
+    lv_obj_t *side = make_panel(screen, 598, 70, 188, 328);
+    add_title(side, "MEASUREMENTS");
+
+    voltage_label = lv_label_create(side);
+    lv_label_set_text(voltage_label, "12.438");
+    lv_obj_set_style_text_color(voltage_label, color(0xF4F7FA), 0);
+    lv_obj_set_style_text_font(voltage_label, &lv_font_montserrat_48, 0);
+    lv_obj_align(voltage_label, LV_ALIGN_TOP_LEFT, 0, 40);
+
+    lv_obj_t *unit = lv_label_create(side);
+    lv_label_set_text(unit, "V");
+    lv_obj_set_style_text_color(unit, color(0x20D6B0), 0);
+    lv_obj_set_style_text_font(unit, &lv_font_montserrat_24, 0);
+    lv_obj_align(unit, LV_ALIGN_TOP_RIGHT, -2, 60);
+
+    const char *items[] = {"CURRENT", "1.284 A", "POWER", "15.97 W", "RIPPLE", "42.6 mV"};
+    for (int i = 0; i < 6; ++i) {
+        lv_obj_t *label = lv_label_create(side);
+        lv_label_set_text(label, items[i]);
+        lv_obj_set_pos(label, 0, 118 + (i / 2) * 56 + (i % 2) * 22);
+        lv_obj_set_style_text_color(label, (i % 2) ? color(0xDFE7EF) : color(0x6D839A), 0);
+        lv_obj_set_style_text_font(label, (i % 2) ? &lv_font_montserrat_20 : &lv_font_montserrat_14, 0);
+    }
+
+    lv_obj_t *footer = make_panel(screen, 14, 412, 772, 54);
+
+    run_button = lv_button_create(footer);
+    lv_obj_set_pos(run_button, 0, -1);
+    lv_obj_set_size(run_button, 118, 32);
+    lv_obj_set_style_radius(run_button, 6, 0);
+    lv_obj_set_style_bg_color(run_button, color(0xE5A72C), 0);
+    lv_obj_add_event_cb(run_button, run_event, LV_EVENT_CLICKED, nullptr);
+    run_label = lv_label_create(run_button);
+    lv_label_set_text(run_label, "PAUSE");
+    lv_obj_center(run_label);
+
+    const char *footer_items[] = {"TIME/DIV  100 ms", "SCALE  2.0 V", "TRIGGER  AUTO"};
+    const int xpos[] = {155, 362, 565};
+    for (int i = 0; i < 3; ++i) {
+        lv_obj_t *label = lv_label_create(footer);
+        lv_label_set_text(label, footer_items[i]);
+        lv_obj_set_pos(label, xpos[i], 7);
+        lv_obj_set_style_text_color(label, color(0xAFC0D0), 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    }
+}
+
+void update_waveform() {
+    const float x = sample_index * 0.14f;
+    const int value = static_cast<int>(58.0f * sinf(x) + 10.0f * sinf(x * 3.7f));
+    lv_chart_set_next_value(chart, wave_series, value);
+
+    const float voltage = 12.40f + 0.08f * sinf(sample_index * 0.035f);
+    lv_label_set_text_fmt(voltage_label, "%0.3f", voltage);
+    ++sample_index;
+}
+}  // namespace
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("JCY1000-5: init display");
+    smartdisplay_init();
+    create_ui();
+    Serial.println("JCY1000-5: UI ready");
+}
+
+void loop() {
+    const uint32_t now = millis();
+    if (running && now - last_sample_ms >= 25) {
+        update_waveform();
+        last_sample_ms = now;
+    }
+    lv_timer_handler();
+    delay(5);
+}

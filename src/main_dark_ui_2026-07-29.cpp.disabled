@@ -1,0 +1,418 @@
+#include <Arduino.h>
+#include <Arduino_GFX_Library.h>
+#include <TAMC_GT911.h>
+#include <lvgl.h>
+
+LV_FONT_DECLARE(lv_font_jcy16);
+
+namespace {
+constexpr int SCREEN_WIDTH = 800;
+constexpr int SCREEN_HEIGHT = 480;
+constexpr int BACKLIGHT_PIN = 2;
+constexpr int TOUCH_SDA = 19;
+constexpr int TOUCH_SCL = 20;
+constexpr int TOUCH_INT = -1;
+constexpr int TOUCH_RST = 38;
+
+Arduino_ESP32RGBPanel rgb_bus(
+    GFX_NOT_DEFINED, GFX_NOT_DEFINED, GFX_NOT_DEFINED,
+    40, 41, 39, 42,
+    45, 48, 47, 21, 14,
+    5, 6, 7, 15, 16, 4,
+    8, 3, 46, 9, 1);
+
+Arduino_RPi_DPI_RGBPanel gfx(
+    &rgb_bus,
+    SCREEN_WIDTH, 0, 8, 4, 8,
+    SCREEN_HEIGHT, 0, 8, 4, 8,
+    1, 16000000, true);
+
+TAMC_GT911 touch(
+    TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST,
+    SCREEN_WIDTH, SCREEN_HEIGHT);
+
+lv_disp_draw_buf_t draw_buffer;
+lv_color_t *draw_pixels = nullptr;
+lv_disp_drv_t display_driver;
+lv_indev_drv_t touch_driver;
+
+enum class WorkMode : uint8_t {
+    BatterySimulator,
+    BidirectionalPower,
+};
+
+constexpr WorkMode MODE_OPTIONS[] = {
+    WorkMode::BatterySimulator,
+    WorkMode::BidirectionalPower,
+};
+constexpr int VOLTAGE_STEPS[] = {-1, 1};
+constexpr float QUICK_VOLTAGES[] = {24.0f, 25.0f, 28.0f, 36.0f};
+
+WorkMode active_mode = WorkMode::BatterySimulator;
+bool output_running = true;
+float set_voltage = 0.0f;
+
+lv_obj_t *mode_buttons[2] = {nullptr, nullptr};
+lv_obj_t *mode_labels[2] = {nullptr, nullptr};
+lv_obj_t *status_led = nullptr;
+lv_obj_t *status_value_label = nullptr;
+lv_obj_t *set_voltage_label = nullptr;
+lv_obj_t *power_button = nullptr;
+lv_obj_t *power_state_label = nullptr;
+
+lv_color_t color(uint32_t rgb) {
+    return lv_color_hex(rgb);
+}
+
+void display_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *pixels) {
+    const uint32_t width = area->x2 - area->x1 + 1;
+    const uint32_t height = area->y2 - area->y1 + 1;
+    gfx.draw16bitRGBBitmap(area->x1, area->y1,
+                           reinterpret_cast<uint16_t *>(&pixels->full),
+                           width, height);
+    lv_disp_flush_ready(disp);
+}
+
+void touch_read(lv_indev_drv_t *, lv_indev_data_t *data) {
+    touch.read();
+    if (!touch.isTouched) {
+        data->state = LV_INDEV_STATE_REL;
+        return;
+    }
+
+    data->state = LV_INDEV_STATE_PR;
+    data->point.x = constrain(
+        map(touch.points[0].x, SCREEN_WIDTH, 0, 0, SCREEN_WIDTH - 1),
+        0, SCREEN_WIDTH - 1);
+    data->point.y = constrain(
+        map(touch.points[0].y, SCREEN_HEIGHT, 0, 0, SCREEN_HEIGHT - 1),
+        0, SCREEN_HEIGHT - 1);
+}
+
+lv_obj_t *make_panel(lv_obj_t *parent, int x, int y, int width, int height) {
+    lv_obj_t *panel = lv_obj_create(parent);
+    lv_obj_set_pos(panel, x, y);
+    lv_obj_set_size(panel, width, height);
+    lv_obj_set_style_radius(panel, 10, 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_border_color(panel, color(0x27374A), 0);
+    lv_obj_set_style_bg_color(panel, color(0x111A26), 0);
+    lv_obj_set_style_pad_all(panel, 0, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    return panel;
+}
+
+lv_obj_t *make_label(lv_obj_t *parent, const char *text, int x, int y,
+                     const lv_font_t *font, uint32_t text_color) {
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, color(text_color), 0);
+    return label;
+}
+
+lv_obj_t *make_button(lv_obj_t *parent, int x, int y, int width, int height,
+                      uint32_t bg_color) {
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_pos(button, x, y);
+    lv_obj_set_size(button, width, height);
+    lv_obj_set_style_radius(button, 8, 0);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_border_color(button, color(0x33475C), 0);
+    lv_obj_set_style_bg_color(button, color(bg_color), 0);
+    lv_obj_set_style_bg_color(button, color(0x324A61), LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    return button;
+}
+
+void refresh_mode_buttons() {
+    for (size_t i = 0; i < 2; ++i) {
+        const bool selected = active_mode == MODE_OPTIONS[i];
+        lv_obj_set_style_bg_color(
+            mode_buttons[i], color(selected ? 0x245C69 : 0x172534), 0);
+        lv_obj_set_style_border_color(
+            mode_buttons[i], color(selected ? 0x20D6B0 : 0x2C3D50), 0);
+        lv_obj_set_style_border_width(mode_buttons[i], selected ? 2 : 1, 0);
+        lv_obj_set_style_text_color(
+            mode_labels[i], color(selected ? 0xFFFFFF : 0x8FA3B8), 0);
+    }
+}
+
+void refresh_power_state() {
+    const uint32_t button_color = output_running ? 0xE5A72C : 0x1CC8A0;
+    const uint32_t led_color = output_running ? 0x1CC8A0 : 0xE5A72C;
+
+    lv_obj_set_style_bg_color(power_button, color(button_color), 0);
+    lv_obj_set_style_bg_color(status_led, color(led_color), 0);
+    lv_label_set_text(status_value_label, output_running ? "RUN" : "STOP");
+    lv_obj_set_style_text_color(status_value_label, color(led_color), 0);
+    lv_label_set_text(power_state_label, output_running ? "RUN" : "STOP");
+}
+
+void refresh_set_voltage() {
+    lv_label_set_text_fmt(set_voltage_label, "%04.1fV", set_voltage);
+}
+
+void mode_event(lv_event_t *event) {
+    const auto *mode = static_cast<const WorkMode *>(lv_event_get_user_data(event));
+    if (mode == nullptr || active_mode == *mode) {
+        return;
+    }
+
+    active_mode = *mode;
+    refresh_mode_buttons();
+}
+
+void power_event(lv_event_t *) {
+    output_running = !output_running;
+    refresh_power_state();
+}
+
+void voltage_step_event(lv_event_t *event) {
+    const auto *step = static_cast<const int *>(lv_event_get_user_data(event));
+    if (step == nullptr) {
+        return;
+    }
+
+    set_voltage += static_cast<float>(*step) * 0.1f;
+    set_voltage = constrain(set_voltage, 0.0f, 99.9f);
+    refresh_set_voltage();
+}
+
+void quick_voltage_event(lv_event_t *event) {
+    const auto *voltage = static_cast<const float *>(lv_event_get_user_data(event));
+    if (voltage == nullptr) {
+        return;
+    }
+
+    set_voltage = *voltage;
+    refresh_set_voltage();
+}
+
+void create_header(lv_obj_t *screen) {
+    lv_obj_t *header = lv_obj_create(screen);
+    lv_obj_set_pos(header, 0, 0);
+    lv_obj_set_size(header, SCREEN_WIDTH, 58);
+    lv_obj_set_style_radius(header, 0, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_bg_color(header, color(0x0D1723), 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    make_label(header, "鲸测云", 16, 18, &lv_font_jcy16, 0xF4F7FA);
+    make_label(header, "JCY2001D", 92, 18, &lv_font_montserrat_16, 0x6D839A);
+
+    const char *texts[] = {"工程模式", "帮助", "设置"};
+    const int positions[][2] = {{554, 12}, {668, 12}, {730, 12}};
+    const int widths[] = {96, 52, 54};
+
+    for (size_t i = 0; i < 3; ++i) {
+        lv_obj_t *button = make_button(
+            header, positions[i][0], positions[i][1], widths[i], 34, 0x162332);
+        lv_obj_t *label = lv_label_create(button);
+        lv_label_set_text(label, texts[i]);
+        lv_obj_set_style_text_font(label, &lv_font_jcy16, 0);
+        lv_obj_set_style_text_color(label, color(0xAFC0D0), 0);
+        lv_obj_center(label);
+    }
+}
+
+void create_mode_column(lv_obj_t *screen) {
+    lv_obj_t *panel = make_panel(screen, 12, 68, 115, 398);
+
+    const char *texts[] = {"模拟电池", "双向电源"};
+    for (size_t i = 0; i < 2; ++i) {
+        mode_buttons[i] = make_button(panel, 10, 11 + static_cast<int>(i) * 188,
+                                      93, 176, 0x172534);
+        lv_obj_add_event_cb(mode_buttons[i], mode_event, LV_EVENT_CLICKED,
+                            const_cast<WorkMode *>(&MODE_OPTIONS[i]));
+
+        mode_labels[i] = lv_label_create(mode_buttons[i]);
+        lv_label_set_text(mode_labels[i], texts[i]);
+        lv_obj_set_style_text_font(mode_labels[i], &lv_font_jcy16, 0);
+        lv_obj_set_style_text_color(mode_labels[i], color(0xF4F7FA), 0);
+        lv_obj_center(mode_labels[i]);
+    }
+}
+
+void add_measurement_row(lv_obj_t *panel, const char *name, const char *value,
+                         int y, uint32_t value_color = 0xF4F7FA) {
+    make_label(panel, name, 14, y + 4, &lv_font_jcy16, 0x8FA3B8);
+
+    lv_obj_t *value_label = make_label(
+        panel, value, 0, y, &lv_font_montserrat_20, value_color);
+    lv_obj_align(value_label, LV_ALIGN_TOP_RIGHT, -14, y);
+}
+
+void create_measurement_column(lv_obj_t *screen) {
+    lv_obj_t *panel = make_panel(screen, 137, 68, 260, 398);
+
+    lv_obj_t *percentage = make_label(
+        panel, "70.5%", 0, 13, &lv_font_montserrat_30, 0xF4F7FA);
+    lv_obj_align(percentage, LV_ALIGN_TOP_RIGHT, -14, 13);
+
+    make_label(panel, "状态", 14, 70, &lv_font_jcy16, 0x8FA3B8);
+
+    status_led = lv_obj_create(panel);
+    lv_obj_set_pos(status_led, 83, 73);
+    lv_obj_set_size(status_led, 12, 12);
+    lv_obj_set_style_radius(status_led, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(status_led, 0, 0);
+    lv_obj_set_style_pad_all(status_led, 0, 0);
+
+    status_value_label = make_label(
+        panel, "RUN", 105, 69, &lv_font_montserrat_16, 0x1CC8A0);
+
+    add_measurement_row(panel, "电压", "0.012V", 113, 0x20D6B0);
+    add_measurement_row(panel, "电流", "0.000A", 157);
+    add_measurement_row(panel, "功率", "0.0W", 201);
+    add_measurement_row(panel, "温度", "28°C", 245);
+
+    power_button = make_button(panel, 13, 310, 234, 72, 0xE5A72C);
+    lv_obj_set_style_radius(power_button, 12, 0);
+    lv_obj_set_style_border_width(power_button, 0, 0);
+    lv_obj_add_event_cb(power_button, power_event, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *power_title = lv_label_create(power_button);
+    lv_label_set_text(power_title, "电源");
+    lv_obj_set_style_text_font(power_title, &lv_font_jcy16, 0);
+    lv_obj_set_style_text_color(power_title, color(0x08111C), 0);
+    lv_obj_align(power_title, LV_ALIGN_CENTER, -26, 0);
+
+    power_state_label = lv_label_create(power_button);
+    lv_label_set_text(power_state_label, "RUN");
+    lv_obj_set_style_text_font(power_state_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(power_state_label, color(0x08111C), 0);
+    lv_obj_align(power_state_label, LV_ALIGN_CENTER, 30, 0);
+}
+
+void create_settings_column(lv_obj_t *screen) {
+    lv_obj_t *panel = make_panel(screen, 407, 68, 381, 398);
+
+    make_label(panel, "设置", 14, 14, &lv_font_jcy16, 0xAFC0D0);
+    make_label(panel, "PARAMETERS", 66, 16, &lv_font_montserrat_14, 0x6D839A);
+
+    make_label(panel, "截止电压", 14, 69, &lv_font_jcy16, 0x8FA3B8);
+    lv_obj_t *cutoff_value = make_label(
+        panel, "25.0V", 0, 64, &lv_font_montserrat_20, 0xF4F7FA);
+    lv_obj_align(cutoff_value, LV_ALIGN_TOP_RIGHT, -16, 64);
+
+    lv_obj_t *divider = lv_obj_create(panel);
+    lv_obj_set_pos(divider, 14, 112);
+    lv_obj_set_size(divider, 351, 1);
+    lv_obj_set_style_radius(divider, 0, 0);
+    lv_obj_set_style_border_width(divider, 0, 0);
+    lv_obj_set_style_bg_color(divider, color(0x25374A), 0);
+    lv_obj_set_style_pad_all(divider, 0, 0);
+
+    make_label(panel, "电压设置", 14, 143, &lv_font_jcy16, 0x8FA3B8);
+
+    set_voltage_label = make_label(
+        panel, "00.0V", 139, 137, &lv_font_montserrat_20, 0xF4F7FA);
+
+    const char *step_text[] = {"−", "+"};
+    const int step_x[] = {241, 307};
+    for (size_t i = 0; i < 2; ++i) {
+        lv_obj_t *button = make_button(panel, step_x[i], 132, 52, 42, 0x25374A);
+        lv_obj_add_event_cb(button, voltage_step_event, LV_EVENT_CLICKED,
+                            const_cast<int *>(&VOLTAGE_STEPS[i]));
+
+        lv_obj_t *label = lv_label_create(button);
+        lv_label_set_text(label, step_text[i]);
+        lv_obj_set_style_text_font(label, &lv_font_jcy16, 0);
+        lv_obj_set_style_text_color(label, color(0xF4F7FA), 0);
+        lv_obj_center(label);
+    }
+
+    make_label(panel, "QUICK", 14, 221, &lv_font_montserrat_14, 0x6D839A);
+    make_label(panel, "电压", 70, 219, &lv_font_jcy16, 0x8FA3B8);
+
+    for (size_t i = 0; i < 4; ++i) {
+        lv_obj_t *button = make_button(
+            panel, 14 + static_cast<int>(i) * 87, 258, 76, 64, 0x172A3B);
+        lv_obj_add_event_cb(button, quick_voltage_event, LV_EVENT_CLICKED,
+                            const_cast<float *>(&QUICK_VOLTAGES[i]));
+
+        lv_obj_t *label = lv_label_create(button);
+        lv_label_set_text_fmt(label, "%.0fV", QUICK_VOLTAGES[i]);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(label, color(0xF4F7FA), 0);
+        lv_obj_center(label);
+    }
+
+    make_label(panel, "−/+  0.1V", 14, 350, &lv_font_montserrat_14, 0x6D839A);
+}
+
+void create_ui() {
+    lv_obj_t *screen = lv_obj_create(nullptr);
+    lv_obj_set_style_bg_color(screen, color(0x08111C), 0);
+    lv_obj_set_style_bg_grad_color(screen, color(0x101D2B), 0);
+    lv_obj_set_style_bg_grad_dir(screen, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_pad_all(screen, 0, 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_scr_load(screen);
+
+    create_header(screen);
+    create_mode_column(screen);
+    create_measurement_column(screen);
+    create_settings_column(screen);
+
+    refresh_mode_buttons();
+    refresh_power_state();
+    refresh_set_voltage();
+}
+
+bool init_lvgl() {
+    lv_init();
+
+    constexpr size_t BUFFER_LINES = 40;
+    draw_pixels = static_cast<lv_color_t *>(heap_caps_malloc(
+        sizeof(lv_color_t) * SCREEN_WIDTH * BUFFER_LINES,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!draw_pixels) {
+        Serial.println("LVGL draw buffer allocation failed");
+        return false;
+    }
+
+    lv_disp_draw_buf_init(
+        &draw_buffer, draw_pixels, nullptr, SCREEN_WIDTH * BUFFER_LINES);
+    lv_disp_drv_init(&display_driver);
+    display_driver.hor_res = SCREEN_WIDTH;
+    display_driver.ver_res = SCREEN_HEIGHT;
+    display_driver.flush_cb = display_flush;
+    display_driver.draw_buf = &draw_buffer;
+    lv_disp_drv_register(&display_driver);
+
+    Wire.begin(TOUCH_SDA, TOUCH_SCL);
+    touch.begin();
+    touch.setRotation(ROTATION_NORMAL);
+    lv_indev_drv_init(&touch_driver);
+    touch_driver.type = LV_INDEV_TYPE_POINTER;
+    touch_driver.read_cb = touch_read;
+    lv_indev_drv_register(&touch_driver);
+    return true;
+}
+}  // namespace
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("JCY1000-5 JCY2001D UI init");
+
+    gfx.begin();
+    gfx.fillScreen(BLACK);
+    pinMode(BACKLIGHT_PIN, OUTPUT);
+    digitalWrite(BACKLIGHT_PIN, HIGH);
+
+    if (!init_lvgl()) {
+        return;
+    }
+
+    create_ui();
+    Serial.println("JCY1000-5 UI ready");
+}
+
+void loop() {
+    lv_timer_handler();
+    delay(5);
+}
